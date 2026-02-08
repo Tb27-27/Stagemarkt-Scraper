@@ -4,84 +4,96 @@ import json
 import html
 import re
 
-def clean_html(raw_html):
-    if not raw_html: return ""
-    # Replace common HTML tags with newlines/markdown
-    text = re.sub(r'<br\s*/?>', '\n', raw_html)
-    text = re.sub(r'</p>', '\n\n', text)
-    text = re.sub(r'<li>', '\n- ', text)
-    text = re.sub(r'<[^<]+?>', '', text)
-    return html.unescape(text).strip()
+def clean_text(text):
+    if not text: return "Niet vermeld"
+    # Clean up whitespace and standard formatting
+    return " ".join(text.split()).strip()
 
 def scrape_vacancy(url):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
     except Exception as e:
-        print(f"❌ Error: Kon pagina niet ophalen. ({e})")
+        print(f"❌ Error: {e}")
         return None
 
     soup = BeautifulSoup(response.text, 'html.parser')
-    json_ld_script = soup.find('script', type='application/ld+json')
     
-    if not json_ld_script:
-        print("❌ Error: Geen gestructureerde data gevonden op deze pagina.")
+    # --- 1. JSON-LD Extraction ---
+    json_ld_script = soup.find('script', type='application/ld+json')
+    job_data = {}
+    if json_ld_script:
+        try:
+            data = json.loads(json_ld_script.string)
+            graph = data.get("@graph", [data])
+            for item in graph:
+                if item.get("@type") == "JobPosting":
+                    job_data = item
+                    break
+        except:
+            pass
+
+    # --- 2. Improved Label Logic ---
+    def get_info_by_label(label_text):
+        # Look for labels specifically inside <strong> tags
+        label_tag = soup.find('strong', string=re.compile(label_text, re.I))
+        if label_tag:
+            # Check the next sibling or parent text container
+            parent = label_tag.find_parent('div')
+            if parent:
+                # Remove the label part and clean the rest
+                val = parent.get_text(separator=" ").replace(label_tag.get_text(), "").strip()
+                # If the result starts with a colon or whitespace, clean it
+                val = re.sub(r'^[:\s]+', '', val)
+                return clean_text(val)
         return None
 
-    data = json.loads(json_ld_script.string)
-    job = {}
-    
-    # Extract JobPosting from Graph
-    if "@graph" in data:
-        for item in data["@graph"]:
-            if item.get("@type") == "JobPosting":
-                job = item
-                break
-    else:
-        job = data
-
-    # Get standard fields
-    title = job.get("title", "Geen titel")
-    description = clean_html(job.get("description", ""))
-    skills = clean_html(job.get("skills", ""))
-    full_text = f"{description}\n\n### Vaardigheden/Eisen:\n{skills}"
-    
-    # Get contact info
-    loc = job.get("jobLocation", {})
-    address_data = loc.get("address", {})
-    address = f"{address_data.get('streetAddress', 'N/A')}, {address_data.get('postalCode', '')} {loc.get('name', '')}"
-    phone = loc.get("telephone", "Niet vermeld")
-    
-    # The email is often hidden in the 'hiringOrganization' or the HTML itself
-    email = "Niet vermeld (check website)"
+    # Extraction
+    contact_person_raw = get_info_by_label("Contact persoon")
+    # Clean email from the contact person string if they are combined
+    email = get_info_by_label("E-mail")
     contact_person = "Niet vermeld"
     
-    # Logic to find email/person in the HTML if not in JSON
-    contact_section = soup.find('div', class_='text-sbb-body-sm')
-    if contact_section:
-        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', contact_section.get_text())
-        if email_match:
+    if contact_person_raw:
+        # If the email is inside the contact person string, separate them
+        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', contact_person_raw)
+        if email_match and not email:
             email = email_match.group(0)
-        
-        person_tag = contact_section.find('strong')
-        if person_tag:
-            contact_person = person_tag.get_text()
+        # The person's name is usually the first line or bold part
+        contact_person = contact_person_raw.split('E:')[0].strip()
 
-    # Get Recognition Code (Leerbedrijf ID)
+    phone = get_info_by_label("Telefoonnummer")
+    address = get_info_by_label("Adres")
+    
+    # Fallbacks
+    if not phone: phone = job_data.get("jobLocation", {}).get("telephone", "Niet vermeld")
+    if not address:
+        addr = job_data.get("jobLocation", {}).get("address", {})
+        address = f"{addr.get('streetAddress', '')}, {addr.get('postalCode', '')} {job_data.get('jobLocation', {}).get('name', '')}"
+
+    # Fix recognition code regex (using raw string r"")
     recognition_code = "N/A"
-    id_tag = soup.find(string=re.compile("Leerbedrijf ID"))
-    if id_tag:
-        recognition_code = id_tag.split("ID")[-1].strip()
+    code_tag = soup.find(string=re.compile(r"ID \d+"))
+    if code_tag:
+        code_match = re.search(r"\d+", code_tag)
+        if code_match:
+            recognition_code = code_match.group()
+
+    # Clean description HTML
+    desc_val = job_data.get("description", "")
+    clean_desc = re.sub(r'<[^<]+?>', '\n', desc_val)
 
     return {
         "url": url,
-        "title": title,
-        "text": full_text,
-        "person": contact_person,
-        "phone": phone,
-        "email": email,
-        "address": address,
+        "title": job_data.get("title", "Geen titel"),
+        "text": html.unescape(clean_desc).strip(),
+        "person": contact_person or "Niet vermeld",
+        "phone": phone or "Niet vermeld",
+        "email": email or "Niet vermeld",
+        "address": address or "Niet vermeld",
         "code": recognition_code
     }
 
@@ -90,39 +102,46 @@ def main():
     student_nr = input("Voer je studentnummer in: ")
     full_name = input("Voer je voor- en achternaam in: ")
     
+    # Filename exactly as requested
     filename = f"Keuzedeel Solliciteren {student_nr} {full_name}.md"
-    count = 0
-
-    print(f"\n✅ Bestand wordt aangemaakt: {filename}")
     
-    while count < 8:
-        print(f"\n--- Vacature {count + 1} van 8 ---")
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(f"# Keuzedeel Solliciteren\n")
+        f.write(f"**Naam:** {full_name}\n")
+        f.write(f"**Studentnummer:** {student_nr}\n\n")
+        f.write(f"---\n\n")
+
+    count = 0
+    max_vacancies = 8
+    
+    while count < max_vacancies:
+        print(f"\n--- Vacature {count + 1} van {max_vacancies} ---")
         url = input("Paste de Stagemarkt URL (of type 'stop' om af te sluiten): ")
         
         if url.lower() == 'stop':
             break
             
-        result = scrape_vacancy(url)
+        data = scrape_vacancy(url)
         
-        if result:
+        if data:
             with open(filename, "a", encoding="utf-8") as f:
-                f.write(f"## Vacature {count + 1}: {result['title']}\n\n")
-                f.write(f"1. **URL:** {result['url']}\n\n")
-                f.write(f"2. **Vacature tekst:**\n{result['text']}\n\n")
-                f.write(f"3. **Contactpersoon:** {result['person']}\n\n")
-                f.write(f"4. **Telefoonnummer:** {result['phone']}\n\n")
-                f.write(f"5. **E-mailadres:** {result['email']}\n\n")
-                f.write(f"6. **Bezoekadres:** {result['address']}\n\n")
-                f.write(f"### 🖋️ Persoonlijke Reflectie (Zelf invullen):\n")
-                f.write(f"**a) Passend bij opleiding/afstudeerrichting:** \n*(Vul hier in waarom dit past bij jouw studie...)*\n\n")
-                f.write(f"**b) Erkenningscode:** Het bedrijf heeft code: `{result['code']}`. \n\n")
-                f.write(f"**c) Inhoud/Leerdoelen:** \n*(Vul hier in waarom dit de juiste ontwikkelrichting is voor jou...)*\n\n")
+                f.write(f"## Vacature {count + 1}: {data['title']}\n\n")
+                f.write(f"1. **URL:** {data['url']}\n\n")
+                f.write(f"2. **Vacature tekst:**\n{data['text']}\n\n")
+                f.write(f"3. **Contactpersoon:** {data['person']}\n\n")
+                f.write(f"4. **Telefoonnummer:** {data['phone']}\n\n")
+                f.write(f"5. **E-mailadres:** {data['email']}\n\n")
+                f.write(f"6. **Bezoekadres:** {data['address']}\n\n")
+                f.write(f"### 🖋️ Reflectie\n")
+                f.write(f"**a) Passend bij opleiding:** ...\n\n")
+                f.write(f"**b) Erkenningscode:** `{data['code']}`\n\n")
+                f.write(f"**c) Inhoud/Ontwikkelrichting:** ...\n\n")
                 f.write(f"---\n\n")
             
             count += 1
-            print(f"✅ Vacature {count} succesvol toegevoegd aan het bestand!")
+            print(f"✅ Vacature {count} succesvol toegevoegd!")
         
-    print(f"\n🎉 Klaar! Je kunt nu '{filename}' openen, de reflectievragen beantwoorden en het opslaan als PDF.")
+    print(f"\n🎉 Klaar! Het bestand '{filename}' staat voor je klaar.")
 
 if __name__ == "__main__":
     main()
